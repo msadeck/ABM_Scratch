@@ -7,7 +7,41 @@ from scipy import integrate
 import matplotlib as mpl
 from scipy import interpolate
 import time
+from scipy.sparse import lil_matrix
+from mpl_toolkits.mplot3d import Axes3D
+from tqdm import tqdm
 
+def compute_derivative(t, y):
+    """
+    Compute dy/dt using finite differences:
+    - Forward difference at the first point
+    - Centered differences for interior points
+    - Backward difference at the last point
+
+    Parameters:
+    - t: time array (1D)
+    - y: corresponding y-values (1D), e.g., ABM output
+
+    Returns:
+    - dydt: array of derivatives (same length as t)
+    """
+    t = np.asarray(t).flatten()
+    y = np.asarray(y).flatten()
+    n = len(t)
+    dydt = np.zeros(n)
+
+    # Forward difference for the first point
+    dydt[0] = (y[1] - y[0]) / (t[1] - t[0])
+
+    # Centered differences for internal points
+    for i in range(1, n - 1):
+        dydt[i] = (y[i+1] - y[i-1]) / (t[i+1] - t[i-1])
+
+    # Backward difference for the last point
+    dydt[-1] = (y[-1] - y[-2]) / (t[-1] - t[-2])
+
+    return dydt
+    
 def SIR_ODE(t,y,q,desc):
 
     dydt = np.zeros((3,))
@@ -36,7 +70,7 @@ def ODE_sim(q,RHS,t,IC,description=None):
 
     #make RHS a function of t,y
     def RHS_ty(t,y):
-        return RHS(t,y,q,description)
+         return RHS(t,y,q,description)
             
     #initialize solution
     y = np.zeros((len(y0),len(t)))   
@@ -61,152 +95,200 @@ def ODE_sim(q,RHS,t,IC,description=None):
 
     return y
 
+def local_neighborhood_mask(A_shape, loc, distance=1):
+    '''
+    Create a sparse matrix with 1s in the neighborhood of a point (loc),
+    and 0s elsewhere.
 
-def BDM_ABM(rp,rd,rm,T_end=5.0):
+    Parameters:
+    - A_shape: tuple (rows, cols) of the matrix
+    - loc: tuple (x, y) center of the neighborhood
+    - distance: neighborhood distance (default = 1)
 
-    #number of lattice sites
+    Returns:
+    - mask: sparse lil_matrix with 1s in the neighborhood
+    '''
+    rows, cols = A_shape
+    x, y = loc
+
+    # Create an empty sparse matrix
+    mask = lil_matrix((rows, cols), dtype=int)
+
+    # Compute neighborhood bounds
+    for i in range(max(0, x - distance), min(rows, x + distance + 1)):
+        for j in range(max(0, y - distance), min(cols, y + distance + 1)):
+            mask[i, j] = 1
+
+    return mask
+
+
+import numpy as np
+from scipy import interpolate
+import numpy as np
+from scipy import interpolate
+
+def BDM_ABM(rp, rd, rm, scale, T_end, initial_density):
+    # Define the size of the lattice (n x n)
     n = 120
 
+    # Initialize the lattice with all zeros (empty cells)
     A = np.zeros((n**2,))
 
-    #initial proportions of occupied sires
-    A0 = 0.05
-    
-    #randomly place susceptible (1), infected (2), and recovered (3) agents
-    A_num = int(np.ceil(A0*len(A)))
-    A[:A_num] = 1
-    #shuffle up
-    A = A[np.random.permutation(n**2)]
-    #make square
-    A = A.reshape(n,n)
+    # Set initial proportion of occupied sites
+    A0 = initial_density
+    A_num = int(np.ceil(A0 * len(A)))
 
-    #count number of susceptible, infected, and recovered agents.
-    A_num = np.sum(A==1)
+    # Create a scratch (empty vertical strip in the center of the grid)
+    radius = n // 6
+    scratch = set(range(n//2 - radius, n//2 + radius))
+    start_positions = [(i, j) for i in range(n) for j in range(n) if j not in scratch]
 
-    #nondimensionalized time
-    T_final = T_end/(rp-rd)
+    # Randomly select initial occupied positions avoiding the scratch
+    chosen_indices = np.random.choice(len(start_positions), size=A_num, replace=False)
+    for idx in chosen_indices:
+        i, j = start_positions[idx]
+        A[i * n + j] = 1
 
-    #initialize time
+    # Reshape to 2D lattice and count initial number of agents
+    A = A.reshape(n, n)
+    A_num = np.sum(A == 1)
+
+    # Calculate final simulation time (non-dimensionalized)
+    T_final = T_end / (rp - rd)
+
+    # Initialize simulation time and tracking lists
     t = 0
-
-    #track time, agent proportions, and snapshots of ABM in these lists
     t_list = [t]
     A_list = [A_num]
-    plot_list = [A]
-    
-    #number of snapshots saved
+    plot_list = [np.copy(A)]
+    density_profiles = [np.sum(A == 1, axis=0) / A.shape[0]]  # initial density profile
     image_count = 1
 
+    # Initialize progress bar for user feedback
+    pbar = tqdm(total=50, desc="Running ABM", leave=True)
 
+    # Main simulation loop
     while t_list[-1] < T_final:
+        # Find all occupied locations and select a random agent
+        agent_loc = np.where(A != 0)
+        agent_ind = np.random.permutation(len(agent_loc[0]))[0]
+        loc = (agent_loc[0][agent_ind], agent_loc[1][agent_ind])
 
-        a = rm*(A_num) + rp*A_num + rd*A_num
-        
-        tau = -np.log(np.random.uniform())/a
+        # Get the local neighborhood mask and compute number of neighbors
+        mask = local_neighborhood_mask((n, n), loc, distance=1)
+        neigh_den = mask.multiply(A)
+        result = np.sum(neigh_den == 1)
+
+        # Update movement/proliferation rates based on local density
+        if result >= 3:
+            rmf = scale * rm
+            rpf = (1 / scale) * rp
+        else:
+            rmf = (1 / scale) * rm
+            rpf = scale * rp
+
+        # Total rate of all possible events
+        a = rmf * A_num + rpf * A_num + rd * A_num
+
+        # Time step
+        tau = -np.log(np.random.uniform()) / a
         t += tau
 
-        Action = a*np.random.uniform()
+        # Randomly choose which event occurs
+        Action = a * np.random.uniform()
 
-        if Action <= rm*(A_num):
-            #agent movement
-            
-            # Select Random agent
-            agent_loc = np.where(A!=0)
-            agent_ind = np.random.permutation(len(agent_loc[0]))[0]
-            loc = (agent_loc[0][agent_ind],agent_loc[1][agent_ind])
-            
-            #determine status
+        # Movement event
+        if Action <= rmf * A_num:
             agent_state = A[loc]
+            dir_select = np.random.randint(1, 5)
+            if dir_select == 1 and loc[0] < n - 1 and A[loc[0] + 1, loc[1]] == 0:
+                A[loc[0] + 1, loc[1]] = agent_state
+                A[loc] = 0
+            elif dir_select == 2 and loc[0] > 0 and A[loc[0] - 1, loc[1]] == 0:
+                A[loc[0] - 1, loc[1]] = agent_state
+                A[loc] = 0
+            elif dir_select == 3 and loc[1] < n - 1 and A[loc[0], loc[1] + 1] == 0:
+                A[loc[0], loc[1] + 1] = agent_state
+                A[loc] = 0
+            elif dir_select == 4 and loc[1] > 0 and A[loc[0], loc[1] - 1] == 0:
+                A[loc[0], loc[1] - 1] = agent_state
+                A[loc] = 0
 
-            ### Determine direction
-            dir_select = np.ceil(np.random.uniform(high=4.0))
+        # Proliferation event
+        elif Action <= rmf * A_num + rpf * A_num:
+            dir_select = np.random.randint(1, 5)
+            if dir_select == 1 and loc[0] < n - 1 and A[loc[0] + 1, loc[1]] == 0:
+                A[loc[0] + 1, loc[1]] = 1
+            elif dir_select == 2 and loc[0] > 0 and A[loc[0] - 1, loc[1]] == 0:
+                A[loc[0] - 1, loc[1]] = 1
+            elif dir_select == 3 and loc[1] < n - 1 and A[loc[0], loc[1] + 1] == 0:
+                A[loc[0], loc[1] + 1] = 1
+            elif dir_select == 4 and loc[1] > 0 and A[loc[0], loc[1] - 1] == 0:
+                A[loc[0], loc[1] - 1] = 1
 
-            #move right
-            if dir_select == 1 and loc[0]<n-1:
-                if A[(loc[0]+1,loc[1])] == 0:
-                    A[(loc[0]+1,loc[1])] = agent_state
-                    A[loc] = 0
-            #move left
-            elif dir_select == 2 and loc[0]>0:
-                if A[(loc[0]-1,loc[1])] == 0:
-                    A[(loc[0]-1,loc[1])] = agent_state
-                    A[loc] = 0
-            #move up
-            elif dir_select == 3 and loc[1]<n-1:
-                if A[(loc[0],loc[1]+1)] == 0:
-                    A[(loc[0],loc[1]+1)] = agent_state
-                    A[loc] = 0
-
-            #move down                    
-            elif dir_select == 4 and loc[1]>0:
-                if A[(loc[0],loc[1]-1)] == 0:
-                    A[(loc[0],loc[1]-1)] = agent_state
-                    A[loc] = 0
-
-        elif (Action <= rm*(A_num) + rp*A_num):
-            #proliferation event
-            
-            # Select Random agent
-            agent_loc = np.where(A!=0)
-            agent_ind = np.random.permutation(len(agent_loc[0]))[0]
-            loc = (agent_loc[0][agent_ind],agent_loc[1][agent_ind])
-            
-            ### Determine direction
-            dir_select = np.ceil(np.random.uniform(high=4.0))
-
-            #proliferate right
-            if dir_select == 1 and loc[0]<n-1:
-                if A[(loc[0]+1,loc[1])] == 0:
-                    A[(loc[0]+1,loc[1])] = 1
-
-            #proliferate left
-            elif dir_select == 2 and loc[0]>0:
-                if A[(loc[0]-1,loc[1])] == 0:
-                    A[(loc[0]-1,loc[1])] = 1
-
-            #proliferate up        
-            elif dir_select == 3 and loc[1]<n-1:
-                if A[(loc[0],loc[1]+1)] == 0:
-                    A[(loc[0],loc[1]+1)] = 1
-
-            #proliferate down
-            elif dir_select == 4 and loc[1]>0:
-                if A[(loc[0],loc[1]-1)] == 0:
-                    A[(loc[0],loc[1]-1)] = 1
-
-        elif (Action <= rm*(A_num) + rp*A_num + rd*A_num):
-            #death event
-            
-            # Select Random agent
-            agent_loc = np.where(A!=0)
-            agent_ind = np.random.permutation(len(agent_loc[0]))[0]
-            loc = (agent_loc[0][agent_ind],agent_loc[1][agent_ind])
-            
+        # Death event
+        else:
             A[loc] = 0
 
-        #count number of susceptible, infected, recovered agents
-        A_num = np.sum(A==1)
-        
-        #append information to lists
+        # Update counts and tracking
+        A_num = np.sum(A == 1)
+        density_profile = np.sum(A == 1, axis=0) / A.shape[0]  # average across rows
         t_list.append(t)
         A_list.append(A_num)
-        
-        #sometimes save ABM snapshot
+        density_profiles.append(density_profile)
+
+        # Save snapshot if time passed threshold
         if len(t_list) == 2:
             plot_list.append(np.copy(A))
-            image_count+=1
-        elif (t_list[-2] < image_count*T_final/50 and t_list[-1] >= image_count*T_final/50): 
+            image_count += 1
+        elif t_list[-2] < image_count * T_final / 50 and t_list[-1] >= image_count * T_final / 50:
             plot_list.append(np.copy(A))
-            image_count+=1
+            image_count += 1
+            pbar.update(1)  # progress bar
 
-    #interpolation to equispace grid
-    t_out = np.linspace(0,T_final,100)
+    pbar.close()
 
-    f = interpolate.interp1d(t_list,A_list)
+    # Interpolate agent count over uniform time grid
+    t_out = np.linspace(0, T_final, 100)
+    f = interpolate.interp1d(t_list, A_list)
     A_out = f(t_out)
 
-    return A_out,t_out,plot_list
+    # Convert list of density profiles to NumPy array
+    density_profiles = np.array(density_profiles)
 
+    # Interpolate each column of the density profile
+    interp_profiles = np.array([
+        np.interp(t_out, t_list, density_profiles[:, j])
+        for j in range(density_profiles.shape[1])
+    ]).T  # shape: (len(t_out), width)
+
+    # Return interpolated agent count, time vector, plot snapshots, and interpolated density
+    return A_out, t_out, plot_list, interp_profiles
+
+def plot_density_3d(t_out, interp_profiles):
+    """
+    Plot a 3D surface of density over time and position.
+    X-axis: Position (space)
+    Y-axis: Time
+    Z-axis: Density
+    """
+    # Create meshgrid for surface plot
+    time_grid, pos_grid = np.meshgrid(t_out, np.arange(interp_profiles.shape[1]), indexing='ij')
+
+    # Set up 3D figure
+    fig = plt.figure(figsize=(12, 8))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Plot surface
+    surf = ax.plot_surface(pos_grid, time_grid, interp_profiles, cmap='viridis', edgecolor='none')
+    ax.set_xlabel('Position')
+    ax.set_ylabel('Time')
+    ax.set_zlabel('Density')
+    ax.set_title('Density Over Time and Position')
+    fig.colorbar(surf, ax=ax, shrink=0.5, aspect=10, label='Density')
+
+    plt.tight_layout()
+    plt.show()
 
 def SIR_ABM(ri,rr,rm,T_end=5.0):
 
