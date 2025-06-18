@@ -128,142 +128,119 @@ import numpy as np
 from scipy import interpolate
 
 def BDM_ABM(rp, rd, rm, scale, T_end, initial_density):
-    # Define the size of the lattice (n x n)
-    n = 120
+    import numpy as np
+    from scipy import interpolate
+    from scipy.sparse import csr_matrix
+    from tqdm import tqdm
 
-    # Initialize the lattice with all zeros (empty cells)
+    n = 120  # lattice size
     A = np.zeros((n**2,))
 
-    # Set initial proportion of occupied sites
+    # Set initial density
     A0 = initial_density
     A_num = int(np.ceil(A0 * len(A)))
-
-    # Create a scratch (empty vertical strip in the center of the grid)
-    radius = n // 6
-    scratch = set(range(n//2 - radius, n//2 + radius))
-    start_positions = [(i, j) for i in range(n) for j in range(n) if j not in scratch]
-
-    # Randomly select initial occupied positions avoiding the scratch
-    chosen_indices = np.random.choice(len(start_positions), size=A_num, replace=False)
-    for idx in chosen_indices:
-        i, j = start_positions[idx]
-        A[i * n + j] = 1
-
-    # Reshape to 2D lattice and count initial number of agents
+    A[:A_num] = 1
+    np.random.shuffle(A)
     A = A.reshape(n, n)
+
+    # Create the scratch *after* random placement
+    scratch_width = 40
+    middle = n // 2
+    half_width = scratch_width // 2
+    A[:, middle - half_width: middle + half_width] = 0
+
+    # Count actual number of agents after scratch
     A_num = np.sum(A == 1)
 
-    # Calculate final simulation time (non-dimensionalized)
+    # Non-dimensionalized time
     T_final = T_end / (rp - rd)
-
-    # Initialize simulation time and tracking lists
     t = 0
+
+    # Tracking
     t_list = [t]
     A_list = [A_num]
     plot_list = [np.copy(A)]
-    density_profiles = [np.sum(A == 1, axis=0) / A.shape[0]]  # initial density profile
+    density_profiles = [np.sum(A == 1, axis=0) / n]
     image_count = 1
 
-    # Initialize progress bar for user feedback
     pbar = tqdm(total=50, desc="Running ABM", leave=True)
 
-    # Main simulation loop
     while t_list[-1] < T_final:
-        # Find all occupied locations and select a random agent
         agent_loc = np.where(A != 0)
-        agent_ind = np.random.permutation(len(agent_loc[0]))[0]
+        agent_ind = np.random.randint(len(agent_loc[0]))
         loc = (agent_loc[0][agent_ind], agent_loc[1][agent_ind])
 
-        # Get the local neighborhood mask and compute number of neighbors
+        # Local density-based rate scaling
         mask = local_neighborhood_mask((n, n), loc, distance=1)
-        neigh_den = mask.multiply(A)
-        result = np.sum(neigh_den == 1)
+        neigh = mask.multiply(A)
+        local_density = np.sum(neigh == 1)
 
-        # Update movement/proliferation rates based on local density
-        if result >= 3:
+        if local_density >= 3:
             rmf = scale * rm
-            rpf = (1 / scale) * rp
+            rpf = rp / scale
         else:
-            rmf = (1 / scale) * rm
+            rmf = rm / scale
             rpf = scale * rp
 
-        # Total rate of all possible events
         a = rmf * A_num + rpf * A_num + rd * A_num
-
-        # Time step
         tau = -np.log(np.random.uniform()) / a
         t += tau
+        action = a * np.random.uniform()
 
-        # Randomly choose which event occurs
-        Action = a * np.random.uniform()
+        # Movement
+        if action <= rmf * A_num:
+            dir = np.random.randint(1, 5)
+            x, y = loc
+            if dir == 1 and x < n - 1 and A[x + 1, y] == 0:
+                A[x + 1, y], A[x, y] = A[x, y], 0
+            elif dir == 2 and x > 0 and A[x - 1, y] == 0:
+                A[x - 1, y], A[x, y] = A[x, y], 0
+            elif dir == 3 and y < n - 1 and A[x, y + 1] == 0:
+                A[x, y + 1], A[x, y] = A[x, y], 0
+            elif dir == 4 and y > 0 and A[x, y - 1] == 0:
+                A[x, y - 1], A[x, y] = A[x, y], 0
 
-        # Movement event
-        if Action <= rmf * A_num:
-            agent_state = A[loc]
-            dir_select = np.random.randint(1, 5)
-            if dir_select == 1 and loc[0] < n - 1 and A[loc[0] + 1, loc[1]] == 0:
-                A[loc[0] + 1, loc[1]] = agent_state
-                A[loc] = 0
-            elif dir_select == 2 and loc[0] > 0 and A[loc[0] - 1, loc[1]] == 0:
-                A[loc[0] - 1, loc[1]] = agent_state
-                A[loc] = 0
-            elif dir_select == 3 and loc[1] < n - 1 and A[loc[0], loc[1] + 1] == 0:
-                A[loc[0], loc[1] + 1] = agent_state
-                A[loc] = 0
-            elif dir_select == 4 and loc[1] > 0 and A[loc[0], loc[1] - 1] == 0:
-                A[loc[0], loc[1] - 1] = agent_state
-                A[loc] = 0
+        # Proliferation
+        elif action <= rmf * A_num + rpf * A_num:
+            dir = np.random.randint(1, 5)
+            x, y = loc
+            if dir == 1 and x < n - 1 and A[x + 1, y] == 0:
+                A[x + 1, y] = 1
+            elif dir == 2 and x > 0 and A[x - 1, y] == 0:
+                A[x - 1, y] = 1
+            elif dir == 3 and y < n - 1 and A[x, y + 1] == 0:
+                A[x, y + 1] = 1
+            elif dir == 4 and y > 0 and A[x, y - 1] == 0:
+                A[x, y - 1] = 1
 
-        # Proliferation event
-        elif Action <= rmf * A_num + rpf * A_num:
-            dir_select = np.random.randint(1, 5)
-            if dir_select == 1 and loc[0] < n - 1 and A[loc[0] + 1, loc[1]] == 0:
-                A[loc[0] + 1, loc[1]] = 1
-            elif dir_select == 2 and loc[0] > 0 and A[loc[0] - 1, loc[1]] == 0:
-                A[loc[0] - 1, loc[1]] = 1
-            elif dir_select == 3 and loc[1] < n - 1 and A[loc[0], loc[1] + 1] == 0:
-                A[loc[0], loc[1] + 1] = 1
-            elif dir_select == 4 and loc[1] > 0 and A[loc[0], loc[1] - 1] == 0:
-                A[loc[0], loc[1] - 1] = 1
-
-        # Death event
+        # Death
         else:
             A[loc] = 0
 
-        # Update counts and tracking
+        # Update tracking
         A_num = np.sum(A == 1)
-        density_profile = np.sum(A == 1, axis=0) / A.shape[0]  # average across rows
         t_list.append(t)
         A_list.append(A_num)
-        density_profiles.append(density_profile)
+        density_profiles.append(np.sum(A == 1, axis=0) / n)
 
-        # Save snapshot if time passed threshold
-        if len(t_list) == 2:
+        if len(t_list) == 2 or (t_list[-2] < image_count * T_final / 50 <= t_list[-1]):
             plot_list.append(np.copy(A))
             image_count += 1
-        elif t_list[-2] < image_count * T_final / 50 and t_list[-1] >= image_count * T_final / 50:
-            plot_list.append(np.copy(A))
-            image_count += 1
-            pbar.update(1)  # progress bar
+            pbar.update(1)
 
     pbar.close()
 
-    # Interpolate agent count over uniform time grid
+    # Interpolate output
     t_out = np.linspace(0, T_final, 100)
-    f = interpolate.interp1d(t_list, A_list)
-    A_out = f(t_out)
-
-    # Convert list of density profiles to NumPy array
+    A_out = interpolate.interp1d(t_list, A_list)(t_out)
     density_profiles = np.array(density_profiles)
-
-    # Interpolate each column of the density profile
     interp_profiles = np.array([
         np.interp(t_out, t_list, density_profiles[:, j])
         for j in range(density_profiles.shape[1])
-    ]).T  # shape: (len(t_out), width)
+    ]).T
 
-    # Return interpolated agent count, time vector, plot snapshots, and interpolated density
     return A_out, t_out, plot_list, interp_profiles
+
 
 def plot_density_3d(t_out, interp_profiles):
     """
