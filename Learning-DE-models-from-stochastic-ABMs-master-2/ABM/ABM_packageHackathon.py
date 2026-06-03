@@ -127,43 +127,47 @@ from scipy import interpolate
 import numpy as np
 from scipy import interpolate
 
-def BDM_ABM(rm, scale, T_end, initial_density):
+def BDM_ABM(rm, scale, T_end, initial_density, record_every=None):
     import numpy as np
     from scipy import interpolate
     from scipy.sparse import csr_matrix
     from tqdm import tqdm
 
     n = 120  # lattice size
-    A = np.zeros((n**2,))
+    A = np.zeros((n**2,), dtype=int)
 
     # Set initial density
     A0 = initial_density
     A_num = int(np.ceil(A0 * len(A)))
-    A[:A_num] = 1
+    A[:A_num] = np.arange(1, A_num + 1)  # unique sequential cell IDs
     np.random.shuffle(A)
     A = A.reshape(n, n)
 
-    # Create the scratch *after* random placement
-    scratch_width = 40
-    middle = n // 2
-    half_width = scratch_width // 2
-    A[:, middle - half_width: middle + half_width] = 0
+    # # Create the scratch *after* random placement
+    # scratch_width = 40
+    # middle = n // 2
+    # half_width = scratch_width // 2
+    # A[:, middle - half_width: middle + half_width] = 0
 
     # Count actual number of agents after scratch
-    A_num = np.sum(A == 1)
+    A_num = np.sum(A > 0)
 
     # Non-dimensionalized time (characteristic scale: 1/rm)
     T_final = T_end / rm
     t = 0
 
+    if record_every is None:
+        record_every = T_final / 50
+    n_frames = max(1, int(T_final / record_every))
+
     # Tracking
     t_list = [t]
     A_list = [A_num]
     plot_list = [np.copy(A)]
-    density_profiles = [np.sum(A == 1, axis=0) / n]
-    image_count = 1
+    density_profiles = [np.sum(A > 0, axis=0) / n]
+    next_record_time = record_every
 
-    pbar = tqdm(total=50, desc="Running ABM", leave=True)
+    pbar = tqdm(total=n_frames, desc="Running ABM", leave=True)
 
     while t_list[-1] < T_final:
         agent_loc = np.where(A != 0)
@@ -173,7 +177,7 @@ def BDM_ABM(rm, scale, T_end, initial_density):
         # Local density-based rate scaling
         mask = local_neighborhood_mask((n, n), loc, distance=1)
         neigh = mask.multiply(A)
-        local_density = np.sum(neigh == 1)
+        local_density = neigh.nnz
 
         if local_density >= 3:
             rmf = scale * rm
@@ -197,14 +201,14 @@ def BDM_ABM(rm, scale, T_end, initial_density):
             A[x, y - 1], A[x, y] = A[x, y], 0
 
         # Update tracking
-        A_num = np.sum(A == 1)
+        A_num = np.sum(A > 0)
         t_list.append(t)
         A_list.append(A_num)
-        density_profiles.append(np.sum(A == 1, axis=0) / n)
+        density_profiles.append(np.sum(A > 0, axis=0) / n)
 
-        if len(t_list) == 2 or (t_list[-2] < image_count * T_final / 50 <= t_list[-1]):
+        while t >= next_record_time:
             plot_list.append(np.copy(A))
-            image_count += 1
+            next_record_time += record_every
             pbar.update(1)
 
     pbar.close()
