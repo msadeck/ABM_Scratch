@@ -133,7 +133,7 @@ def BDM_ABM(rm, scale, T_end, initial_density, record_every=None):
     from scipy.sparse import csr_matrix
     from tqdm import tqdm
 
-    n = 120  # lattice size
+    n = 50  # lattice size
     A = np.zeros((n**2,), dtype=int)
 
     # Set initial density
